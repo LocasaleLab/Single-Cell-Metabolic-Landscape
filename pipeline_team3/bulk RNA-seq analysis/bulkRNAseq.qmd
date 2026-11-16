@@ -1,0 +1,1145 @@
+---
+title: "Bulk RNA-seq analysis on CCLE Colon Cell Lines"
+author: "Mrunali Thokadiwala"
+format:
+  html:
+    self-contained: true
+  pdf:
+    toc: true
+    number-sections: true
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breakanywhere,commandchars=\\\{\}}
+        \fvset{breaklines, breakanywhere, breaksymbolleft={}, breaksymbolright={}}
+        \usepackage[hyphens]{url}
+        \usepackage{hyperref}
+        \setlength{\emergencystretch}{3em}
+---
+
+# Load Libraries
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(biomaRt)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(ComplexHeatmap)
+library(ggrepel)
+library(EnhancedVolcano)
+library(DESeq2)
+```
+
+# Prepare Data
+
+## Reading CCLE RNA-seq Counts
+
+Counts data -\> Genes x Samples
+
+```{r}
+#Path to gzipped Gene Cluster Text (GCT) file, tab-separated
+ccle_data <- "../data/CCLE_RNAseq_genes_counts_20180929.gct.gz"#Reading CCLE counts table from .gct.gz file
+ccle_counts <- read.csv(gzfile(ccle_data), skip = 2, sep = '\t', header = TRUE)
+```
+
+[**Notes:**]{.underline}
+
+-   **Why `skip = 2`?** GCT v1.2+ starts with a version line and a dimensions line—neither are part of the table.
+
+-   `sep = '\t'` because GCT is tab-delimited
+
+-   `header = TRUE` means the first non-skipped row has column names
+
+```{r}
+# Checking dimensions of ccle_counts dataframe
+dim(ccle_counts)
+```
+
+### Filtering and De-duplicating Protein-Coding Genes
+
+There are **56202 genes** (rows) and **1021 samples** (columns) in `ccle_counts` matrix.
+
+1.  There are so many genes because:
+
+    **A)** CCLE gene counts file includes **all annotated genes**, not just protein-coding ones. That means it includes protein-coding + lncRNA + pseudogenes, etc.
+
+    For DE analysis here, we will **filter to include only protein-coding genes**.
+
+    ```{r}
+    ensembl <- biomaRt::useEnsembl(
+  biomart = "genes", 
+  dataset = "hsapiens_gene_ensembl", 
+  mirror = "useast"
+)
+    # Query the selected dataset for protein-coding genes retrieving their Ensembl ID and gene symbol
+    coding_genes_hgnc <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol', 'gene_biotype'),
+                               filters = 'biotype',
+                               values = 'protein_coding',
+                               mart = ensembl)
+
+    # Filter counts matrix for protein-coding genes
+    coding_gene_ids <- coding_genes_hgnc$hgnc_symbol
+    ccle_counts <- ccle_counts[ccle_counts$Description %in% coding_gene_ids, ]
+    ccle_counts <- data.frame(ccle_counts)
+    print(dim(ccle_counts))
+    ```
+
+    So now, we only have **17726 protein-coding genes** in our counts matrix.
+
+    **B)** There could be **duplicated entries for a same gene/gene symbol**. The first two columns in `ccle_counts` are:
+
+    -   *Name* = Ensembl gene ID (often unique)
+
+    -   *Description* = gene symbol (can repeat across multiple Ensembl IDs)
+
+    If this is the case, we will **de-duplicate the dataframe to include only unique gene symbols** or they would interfere with our DE analysis.
+
+    ```{r}
+    #Checking for duplicated gene symbols
+    print(sum(duplicated(ccle_counts$Description)))
+    ```
+
+    Of our protein-coding genes, 33 appear to be duplicated so we will combine them.
+
+    ```{r}
+    # Extract duplicated rows/gene symbols present more than once
+    ccle_counts_dupes <- ccle_counts[ccle_counts$Description %in% ccle_counts$Description[duplicated(ccle_counts$Description)], ]
+
+    #Sum numeric columns for the extracted dupes
+    ccle_counts_dupes_summed <- ccle_counts_dupes %>% group_by(Description) %>% summarize(across(where(is.numeric), sum))
+
+    # Extract non-duplicated rows/gene symbols  
+    ccle_counts_no_duplicates <- ccle_counts[!duplicated(ccle_counts$Description) & !duplicated(ccle_counts$Description, fromLast = TRUE), ]
+
+    # Merge the two dataframes - one with summed values for dupes and other consisting of non-dupes from the original counts matrix 
+    ccle_counts <- bind_rows(ccle_counts_no_duplicates, ccle_counts_dupes_summed)
+    print(dim(ccle_counts))
+    ```
+
+    As expected, this de-duplication resulted in **17693** (17726 - 33) **unique protein-coding genes**.
+
+2.  There are also so many samples/cell lines in this dataset, so we should check for duplicate samples as well.
+
+    ```{r}
+    #Checking for duplicated samples (columns)
+    print(sum(duplicated(colnames(ccle_counts))))
+    ```
+
+    There are no duplicated samples in our dataset.
+
+### Preparing Numeric Counts Matrix
+
+DESeq2 package expects a numeric matrix for counts and require gene IDs separately so it is a good practice to store gene IDs as row names to let the counts matrix remain strictly numeric. In our matrix, we have two non-numeric columns- *Name* (Ensembl ID) and *Description* (gene symbol). We will set *Description* as row names and remove the *Name* column.
+
+```{r}
+# Set Description as row names
+rownames(ccle_counts) <- ccle_counts$Description
+
+# Preserve Name (Ensembl IDs) for later annotation just in case
+gene_map <- ccle_counts[, c("Name", "Description")]
+
+#Drop the Name and Description columns
+ccle_counts <- ccle_counts[, !(names(ccle_counts) %in% c("Name", "Description"))]
+
+print(dim(ccle_counts))
+```
+
+As expected, our `ccle_counts` columns have reduced by two, meaning we have **1019 samples**.
+
+## Reading Metadata for CCLE RNA-seq Samples
+
+Metadata -\> Cell lines/Samples x Information
+
+```{r}
+#Path to metadata, tab-separated
+metadata <- "../data/Cell_lines_annotations_20181226.txt"
+
+#Reading metadata
+ccle_meta <- read.csv(metadata, sep='\t')
+```
+
+```{r}
+#Checking dimension of ccle_meta
+print(dim(ccle_meta))
+```
+
+### Taking intersection of samples in metadata and counts data
+
+We have information for **1461 CCLE samples/cell lines** in this metadata. But our counts data has 1019 (and all unique) samples only. So we will need to look for common samples among both of these data and align them in same order because if rows in metadata and columns in counts data don’t match [exactly]{.underline}, we risk pairing the wrong biological labels with expression data. This compromises all downstream statistical analysis, biological interpretation, and reproducibility.
+
+```{r}
+#Find common samples among both datasets
+common <- intersect(colnames(ccle_counts), ccle_meta$CCLE_ID)
+
+# Subset and reorder count matrix columns and metadata rows so sample order matches 'common'
+ccle_counts <- ccle_counts[, match(common, colnames(ccle_counts))]
+ccle_meta   <- ccle_meta[match(common, ccle_meta$CCLE_ID), ]
+
+#Sanity check for same order of samples in both datasets
+print(head(ccle_meta$CCLE_ID))
+print(head(colnames(ccle_counts)))
+```
+
+Now, the order of samples in counts and meta data look the same.
+
+```{r}
+# No. of columns/samples in ccle_counts
+ncol(ccle_counts)
+
+#No. of rows/samples in ccle_meta
+nrow(ccle_meta)
+```
+
+So we have **1004 samples** in the dataset after preprocessing so far.
+
+### Select useful metadata columns
+
+Currently, metadata has 33 columns and not all are needed for our DE analysis. Keeping only what’s relevant (e.g., tissue type, treatment group, lineage) makes the design formulas for DE analysis and the interpretation of results much clearer.
+
+```{r}
+# Sneak peek into content of metadata columns
+lapply(ccle_meta, function(x) head(unique(x), 10))  # show first 10 unique per column
+```
+
+```{r}
+#Keeping only useful metadata columns
+ccle_meta <- ccle_meta[, c("CCLE_ID","depMapID","Name", "Site_Primary", "Pathology","Histology","Gender", "Age", "Race", "tcga_code", "mutRate","Growth.Medium", "Doubling.Time.Calculated.hrs")]
+
+
+print(head(ccle_meta)[1:3,])
+```
+
+Although for defining biologically different groups we don't need to keep `Growth.Medium` and `Doubling.Time.Calculated.hrs` but we are keeping them just in case we biological subgroups are unclear or too small/unbalanced and can look into these potential technical variations.
+
+### Cleaning metadata entries
+
+Many entries in the metadata are missing, i.e., are *blank* or *NA*. These need to be handled because most analysis frameworks (e.g. DESeq2, limma, regression models) cannot include rows with*NA* in any covariates used in the design formula. If you specify `~ histology + batch` and one of those columns has NAs, those samples will be dropped automatically by the model — possibly reducing your sample size or biasing results without you realizing it.
+
+```{r}
+# Treat "" (blank) as NA so missingness is counted correctly
+ccle_meta[ccle_meta == ""] <- NA
+
+# Calculate fraction of non-missing values per column
+sapply(ccle_meta, function(x) mean(!is.na(x)))
+```
+
+Columns `Race` and `Doubling.Time.Calculated.hrs` have many missing values but we won't drop them because they might still provide context or be used later for exploratory analysis. Re-importing later is harder than keeping them with missing values recoded.
+
+But, we will replace missing values in categorical columns of metadata with *missing-info*.
+
+```{r}
+# Replace NA with "missing-info" only in character columns
+ccle_meta[] <- lapply(ccle_meta, function(col) {
+  if (is.character(col) || is.factor(col)) {
+    col[is.na(col)] <- "missing-info"
+    return(as.character(col))  # keep as character
+  } else {
+    return(col)  # leave numeric columns (Age, mutRate, Doubling.Time.Calculated.hrs) untouched
+  }
+})
+
+print(head(ccle_meta)[1:3,])
+```
+
+As we can see, numeric columns still have NA values intact and we will thus exclude them from design in DESeq2 but can still use for exploratory plots later.
+
+Subset both datasets for a specific cancer
+
+```{r}
+#Check counts per cancer
+table(ccle_meta$Site_Primary)
+```
+
+I am interested in exploring either of these: large intestine, stomach, ovary or skin.
+
+```{r}
+# Cancers of interest
+tissues <- c("large_intestine", "stomach", "ovary", "skin")
+
+# Summarize missingness
+missing_summary <- ccle_meta %>%
+  filter(Site_Primary %in% tissues) %>%
+  group_by(Site_Primary) %>%
+  summarise(
+    across(
+      .cols = everything(),
+      .fns = ~ {
+        if (is.numeric(.)) {
+          # For numeric columns, count NA
+          mean(is.na(.)) * 100
+        } else {
+          # For categorical, count "missing-info"
+          mean(. == "missing-info") * 100
+        }
+      },
+      .names = "pct_missing_{col}"
+    ),
+    .groups = "drop"
+  )
+
+print(missing_summary)
+```
+
+Considering the available data for comparable DE analysis, I selected to go ahead with **large intestine cancer (also known as colon cancer)**. We will also drop `Doubling.Time.Calculated.hrs` since for this cancer type, it is anyway missing \~69% of data.
+
+```{r}
+# Subset metadata for large_intestine
+ccle_meta_li <- ccle_meta %>%
+  filter(Site_Primary == "large_intestine") %>%
+  dplyr::select(-Doubling.Time.Calculated.hrs)  # drop the column
+
+# Subset counts matrix for large intestine sampels only
+ccle_counts_li <- ccle_counts[, ccle_meta_li$CCLE_ID]
+
+# Sanity check
+all(colnames(ccle_counts_li) == ccle_meta_li$CCLE_ID) # Should return TRUE
+```
+
+```{r}
+dim(ccle_counts_li); dim(ccle_meta_li)
+```
+
+Finally, we have **58 samples** to work with.
+
+## Save outputs
+
+```{r}
+outdir <- "../outs"
+
+# Créer le dossier s'il n'existe pas
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+
+write.csv(ccle_counts, file.path(outdir, "1_ccle_counts.csv"))
+write.csv(ccle_meta, file.path(outdir, "1_ccle_meta.csv"), row.names = FALSE)
+
+write.csv(ccle_counts_li, file.path(outdir, "1_ccle_counts_li.csv"))
+write.csv(ccle_meta_li, file.path(outdir, "1_ccle_meta_li.csv"), row.names = FALSE)
+```
+
+# Principal Component Analysis (PCA)
+
+PCA is an **exploratory diagnostic step** that helps us:
+
+-   Understand the main sources of variation in your RNA-seq data.
+
+-   Decide on appropriate design covariates.
+
+-   Detect outliers or batch effects early.
+
+-   Gain confidence that your data makes biological sense before moving to DESeq2/edgeR modeling.
+
+But before that, we need to obtain variance-stabilized counts to reduce heteroscedasticity (variance of counts grows with the mean, i.e., highly expressed genes dominate the variance, while low-expressed genes are drowned out). This way PCA (and clustering/heatmaps) reflects real biological structure rather than technical noise.
+
+## Variance stabilizing transformation (`vst()`)
+
+```{r}
+# Set rownames of metadata to CCLE_ID so they match colnames of counts
+rownames(ccle_meta_li) <- ccle_meta_li$CCLE_ID
+
+# Create DESeqDataSet object
+dds <- DESeqDataSetFromMatrix(countData = data.frame(ccle_counts_li),
+                              colData = ccle_meta_li,
+                              design = ~ Pathology)
+```
+
+```{r}
+# Keep  genes with total count >= 100 only
+keep_genes <- rowSums(counts(dds)) >= 100
+
+# Subset the DESeqDataSet to retain only those genes
+dds <- dds[keep_genes, ]
+```
+
+```{r}
+# Variance stabilizing transformation
+vsd <- vst(dds)
+```
+
+```{r}
+# Verify the vst transformation
+print(head(data.frame(counts(dds)), 2))
+print(head(data.frame(assay(vsd)), 2))
+```
+
+As we can see, the raw counts have been transformed and stored in `vsd` object.
+
+## PCA with `plotPCA()`
+
+```{r}
+# PCA using top 150 most variable genes, coloring samples by 'Pathology'
+plotPCA(vsd, intgroup = "Pathology", ntop = 150)
+```
+
+```{r}
+plotPCA(vsd, intgroup = "Gender", ntop = 150)
+```
+
+```{r}
+plotPCA(vsd, intgroup = c("Age", "Gender"), ntop = 150)
+```
+
+```{r}
+plotPCA(vsd, intgroup = "tcga_code", ntop = 150)
+```
+
+```{r}
+plotPCA(vsd, intgroup = "Race", ntop = 150)
+```
+
+```{r}
+plotPCA(vsd, intgroup = "mutRate", ntop = 150)
+```
+
+None of these metadata columns seem to be driving the segregation of large-intestine cancer cell lines.
+
+## PCA with `prcomp()`
+
+For deeper exploration of the sources of variation captured by PC1, PC2, and subsequent PCs, we will now perform PCA using `prcomp()` which allows extraction of all PC scores, loadings, and variance explained.
+
+```{r}
+# Obtaining the variances of each gene (rows) from vsd matrix
+variances <- rowVars(assay(vsd))
+
+#Selecting top 150 most variable genes based on variances obtained above
+top_var_genes <- order(variances, decreasing = TRUE)[1:150]
+
+# Subsetting the expression matrix (vsd) to include only the top 150 variable genes
+high_var_mat <- assay(vsd)[top_var_genes,]
+
+#Performing PCA using prcomp() to obtain the principal components (PCs) and variances for top 150 variable genes
+pca_res <- prcomp(t(high_var_mat), center = TRUE, scale = FALSE)
+
+#Explanation of the above line in detail:
+#transposed matrix with t() as PCA expects samples x features/gene matrix
+# center = TRUE centers the data, i.e., subtracts column (gene counts) mean from each value in the respective column
+#prcomp() performs PCA
+
+#Computing the percent variance explained by each PC
+explained_variance <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+
+#Creating a combined dataframe for plotting: PC scores of PC1 and PC2 + metadata
+df_pca <- data.frame(PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2], ccle_meta_li)
+
+#Creating a scatterplot of PC1 vs. PC2 where each point is colored by 'Pathology' from metadata
+ggplot(df_pca, aes(x = PC1, y = PC2, color = Pathology)) +
+  geom_point(size = 3, alpha = 0.5) + 
+  theme_classic() + 
+  labs(x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"), 
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"))
+```
+
+## Elbow plot
+
+Next, we create an elbow plot to decide how many PCs explain most of the meaningful variance and to avoid including PCs dominated by noise.
+
+```{r}
+# Creating dataframe with columns PC and Variance listing first 25 values from explained_variance which contains percent variance explained by PCs
+df_variance <- data.frame(PC = seq_len(25), Variance = explained_variance[1:25])
+
+# Plotting elbow plot using the above dataframe
+ggplot(df_variance, aes(x = PC, y = Variance)) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(title = "Elbow Plot (Top 25 PCs)", x = "Principal Component", y = "Explained Variance (%)")
+```
+
+Interpretation:
+
+-   The first 2–4 PCs capture most of the meaningful structure in your dataset.
+
+-   PCs beyond \~5 mainly represent minor variation or noise.
+
+Thus, for exploratory analysis (PCA plots, clustering), focusing on **PC1–PC4** makes sense.
+
+We already plotted PC1 vs PC2, now let's explore how samples group in PC3 vs PC4 PCA plot.\
+
+```{r}
+#Creating a combined dataframe for plotting: PC scores of PC3 and PC4 + metadata
+df_pca_34 <- data.frame(PC3 = pca_res$x[, 3], PC4 = pca_res$x[, 4], ccle_meta_li)
+
+#Creating a scatterplot of PC3 vs. PC4 where each point is colored by 'Pathology' from metadata
+ggplot(df_pca_34, aes(x = PC3, y = PC4, color = Pathology)) +
+  geom_point(size = 3, alpha = 0.5) + 
+  theme_classic() + 
+  labs(x = paste0("PC3: ", round(explained_variance[3], 1), "% variance"), 
+       y = paste0("PC4: ", round(explained_variance[4], 1), "% variance"))
+```
+
+Even PC3 and PC4 capture some variation in the dataset, but this variation does not correspond to strong grouping by *Pathology* status.
+
+## Gene loadings analysis
+
+We know that the main drivers of variation are not captured by our current metadata. So we should explore **gene** **loadings** (weights or coefficients that indicate how much each gene contributes to each PC) which can help us interpret what biological processes or technical factors drive each PC. Basically, this will help us understand *why* our samples separate the way they do in PCA and whether that separation is biologically meaningful or due to unwanted technical artifacts.
+
+```{r}
+# Extract the top 6 gene loadings for PC1.
+pc1_loadings <- pca_res$rotation[, 1] #pca_res$rotation has gene loadings- matrix of genes x PCs <=> 150 x 58 (=no. of samples)
+pc1_sorted_loadings <- sort(pc1_loadings, decreasing = TRUE)
+head(pc1_sorted_loadings, n = 6)
+```
+
+Now, we will plot the variance-stabilized counts (from `assay(vsd)`) of these 6 genes across colon cancer cell line samples.
+
+```{r}
+top6_genes <- names(pc1_sorted_loadings)[1:6]
+
+expr_top6 <- assay(vsd)[top6_genes, ]
+
+df_long <- as.data.frame(expr_top6) %>%
+  mutate(Gene = rownames(.)) %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Expression")
+
+ggplot(df_long, aes(x = Gene, y = Expression)) +
+  geom_boxplot(outlier.shape = NA, fill = "lightblue") +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+  theme_classic() +
+  labs(title = "Expression of Top 6 PC1 Genes in Colon Cancer Samples")
+```
+
+[Interpretation]{.underline}:\
+All six genes show a broad range of expression across samples. Genes **CDH17** and **LGALS4** have relatively high median expression and several samples with high outlier values.
+
+```{r}
+df_long$Sample <- as.character(df_long$Sample)
+df_pca$Sample <- rownames(df_pca)
+
+df_plot <- left_join(df_long, df_pca, by = "Sample")
+
+ggplot(df_plot, aes(x = PC1, y = PC2, color = Expression)) +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~ Gene, scales = "free") +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "PC1 vs PC2 colored by expression of top 6 PC1 genes", color = "Expression")
+```
+
+[Interpretation:]{.underline}
+
+-   Across all six genes **higher expression (yellow-green)** tends to occur on the **right-hand side (positive PC1)**.
+
+-   **Lower expression (purple)** is concentrated on the **left-hand side (negative PC1)**.
+
+<!-- -->
+
+-   This pattern confirms that PC1 is strongly influenced by these genes, consistent with them being the top PC1 loadings.
+
+[Biological interpretation:]{.underline}
+
+-   These six genes collectively maintain intestinal epithelial cell identity, adhesion, differentiation, and proper cellular signaling in the normal colon epithelium.
+
+-   Together, their expression pattern defines colorectal tumor differentiation status - high expression indicates metabolically active, differentiated tumors while low expression indicates dedifferentiated, disrupted tumors with distinct therapeutic vulnerabilities.
+
+<!-- -->
+
+-   **PC1 likely captures this Epithelial Differentiation Status**:
+
+    -   **Right side** (high expression):
+
+        -   **Preserved intestinal identity** (GPA33, some CDH17 function)
+
+        -   **High metabolic/proliferative activity** (active oncogenes: CDH17, CEACAM5, PPP1R1B, PHGR1)
+
+        -   **Aggressive through proliferation and adhesion-mediated mechanisms**
+
+    -   **Left side** (low expression):
+
+        -   **Loss of intestinal differentiation markers** (GPA33, CEACAM5 loss)
+        -   **Disrupted cellular metabolism** and transport systems
+        -   **Aggressive through immune evasion and hypermutation**
+
+Similarly, let's explore PC2.
+
+```{r}
+# Extract gene loadings for PC2
+pc2_loadings <- pca_res$rotation[, 2]
+pc2_sorted_loadings <- sort(pc2_loadings, decreasing = TRUE)
+head(pc2_sorted_loadings, n = 6)
+
+top6_genes_pc2 <- names(pc2_sorted_loadings)[1:6]
+#print(top6_genes)
+
+expr_top6_pc2 <- assay(vsd)[top6_genes_pc2, ]
+
+df_long_pc2 <- as.data.frame(expr_top6_pc2) %>%
+  mutate(Gene = rownames(.)) %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Expression")
+
+ggplot(df_long_pc2, aes(x = Gene, y = Expression)) +
+  geom_boxplot(outlier.shape = NA, fill = "lightblue") +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+  theme_classic() +
+  labs(title = "Expression of Top 6 PC2 Genes in Colon Cancer Samples")
+```
+
+[Interpretation]{.underline}:\
+Similar to above findings, all six genes that are highly variable along PC2 show a broad range of expression across samples.
+
+```{r}
+# Creating faceted PC1-vs-PC2 scatter plots as above
+df_long_pc2$Sample <- as.character(df_long_pc2$Sample)
+df_pca$Sample <- rownames(df_pca)
+
+df_plot <- left_join(df_long_pc2, df_pca, by = "Sample")
+
+ggplot(df_plot, aes(x = PC1, y = PC2, color = Expression)) +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~ Gene, scales = "free") +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "PC1 vs PC2 colored by expression of top 6 PC2 genes", color = "Expression")
+```
+
+[Interpretation:]{.underline}
+
+-   For most genes, **higher expression (yellow-green)** tends to occur on the **upper side (positive PC2)**.
+
+-   **Lower expression (purple)** appears on the **lower side (negative PC2)**.
+
+<!-- -->
+
+-   This pattern confirms that PC2 is influenced by these genes, consistent with them being the top PC2 loadings.
+
+[Biological interpretation:]{.underline}
+
+-   These six genes collectively regulate proteolytic activity, epithelial structure, metabolic transport, and transcriptional control in normal intestinal cells.
+
+-   Together, their expression pattern defines tumor aggressiveness and metabolic reprogramming - high expression indicates highly aggressive, metabolically hyperactive tumors with enhanced invasion capabilities, while low expression indicates less metabolically active tumors with reduced invasive potential.
+
+<!-- -->
+
+-   **PC2 likely captures "Tumor Aggressiveness and Metabolic Reprogramming Spectrum"**:
+
+    -   **Upper region** (high expression):
+
+        -   **Enhanced Proteolytic Activity** (KLK10 and KLK6)
+
+        -   **Metabolic Hyperactivity** (SLC2A3 (GLUT3))
+
+        -   **Invasive Epithelial Phenotype** (KRT23)
+
+    -   **Lower region** (low expression):
+
+        -   **Reduced Proteolytic Activity** (Lower matrix degradation capability, reduced invasive potential)
+        -   **Metabolic Constraints** (Limited glucose uptake capacity, reduced nucleotide synthesis, Less adapted to glucose-poor tumor microenvironments)
+        -   **Less Aggressive Epithelial State** (Reduced EMT signaling and migration capacity, lower immune evasion capabilities)
+
+# Hierarchical Clustering
+
+Hierarchical clustering is an important next step after PCA as it groups samples based on overall similarity across all variables, helping detect natural subgroups, co-expression patterns, and outliers, and is essential for meaningful heatmap visualization and exploratory QC.
+
+We will select the 150 most variable genes from your variance-stabilized data (`vsd`) and create a hierarchically clustered heatmap.
+
+```{r}
+# Identify the top 150 most variable genes across all samples
+high_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 150)
+
+# Extract the variance-stabilized expression matrix for those top variable genes
+high_var_mat <- assay(vsd)[high_var_genes,]
+
+# Generate a heatmap of the top 150 most variable genes
+Heatmap(high_var_mat,
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "complete",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "complete",
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        name = "VST_Counts",)
+```
+
+It looks like we can create 4 clusters from this.
+
+## Dividing samples into four clusters
+
+```{r}
+# Cutting the dendrogram above into 4 cluster
+hc <- hclust(dist(t(high_var_mat)), method = "complete")
+clusters <- cutree(hc, k = 4)
+
+# Heatmap generation
+Heatmap(high_var_mat,
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "complete",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "complete",
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        name = "VST_Counts",
+        column_split = clusters)
+```
+
+The resulting 4 clusters look well-defined.
+
+We could also check whether anything in the metadata corresponds to these clusters.
+
+```{r}
+# Getting list of values in columns of interest to color-code them later
+unique(ccle_meta_li$Pathology)
+unique(ccle_meta_li$Gender)
+unique(ccle_meta_li$Race)
+```
+
+```{r}
+# Copy metadata for convenience, then keep only the columns you want to display above the heatmap
+sample_annotation_df <- ccle_meta_li
+sample_annotation_df <- sample_annotation_df %>% dplyr::select(Pathology, Gender, Race)
+
+# Define a color map for each annotation column (values → colors)
+sample_annotation_colors <- list(
+  Pathology = c("primary" = "orange", "metastasis" = "green"),
+  Gender = c("male" = "blue", "female" = "pink", "missing-info" = "grey"),
+  Race = c("caucasian" = "yellow", "american_indian" = "red", "asian" = "brown", "missing-info" = "grey")
+)
+
+# Build a ComplexHeatmap annotation object using the data frame and color maps
+# 'annotation_label' sets the displayed labels for the annotation tracks
+column_annotation <- HeatmapAnnotation(
+  df = sample_annotation_df,
+  col = sample_annotation_colors,
+  annotation_label = c("Pathology", "Gender", "Race")
+)
+
+# Draw the heatmap of the top variable genes with hierarchical clustering
+# 'top_annotation' adds the colored bars built above to the top of the heatmap
+Heatmap(high_var_mat,
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "complete",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "complete",
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        name = "VST_Counts",
+        column_split = clusters,
+        top_annotation = column_annotation)
+```
+
+No clear separation of clusters can be attributed to either pathology, gender or race. `tcga_code` is the same across all samples and other metadata columns are numeric.
+
+So, we can look into how these clusters defined via hierarchical clustering correspond to what we see in the PCA plot.
+
+```{r}
+#Creating a PCA dataframe PC scores of PC1 and PC2 for plotting
+pca_df <- data.frame(pca_res$x[, 1:2])
+
+#Clustering the dataset into 2 groups for simplicity
+#clusters <- cutree(hc, k = 2)
+
+# Adding cluster assignments to PCA dataframe
+pca_df$Cluster <- factor(clusters)
+
+# Creating a scatterplot of PC1 vs. PC2 where each point is colored by 'Cluster' 
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.5) +
+  scale_color_manual(values = hue_pal()(length(unique(clusters)))) +
+  theme_classic() +
+  labs(x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"), 
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"),
+       color = "Cluster")
+```
+
+The above plot reflects that the 4 clusters defined by hierarchical clustering also show up in the PCA plot as distinct groups.
+
+But clusters 3 and 4 have very few samples, so for simplicity of DE analysis in the next step, we will only define two clusters.
+
+## Dividing samples into two clusters
+
+```{r}
+# Cutting the dendrogram above into 2 cluster
+hc <- hclust(dist(t(high_var_mat)), method = "complete")
+clusters <- cutree(hc, k = 2)
+
+# Copy metadata for convenience, then keep only the columns you want to display above the heatmap
+sample_annotation_df <- ccle_meta_li
+sample_annotation_df <- sample_annotation_df %>% dplyr::select(Pathology, Gender, Race)
+
+# Define a color map for each annotation column (values → colors)
+sample_annotation_colors <- list(
+  Pathology = c("primary" = "orange", "metastasis" = "green"),
+  Gender = c("male" = "blue", "female" = "pink", "missing-info" = "grey"),
+  Race = c("caucasian" = "yellow", "american_indian" = "red", "asian" = "brown", "missing-info" = "grey")
+)
+
+# Build a ComplexHeatmap annotation object using the data frame and color maps
+# 'annotation_label' sets the displayed labels for the annotation tracks
+column_annotation <- HeatmapAnnotation(
+  df = sample_annotation_df,
+  col = sample_annotation_colors,
+  annotation_label = c("Pathology", "Gender", "Race")
+)
+
+# Draw the heatmap of the top variable genes with hierarchical clustering
+# 'top_annotation' adds the colored bars built above to the top of the heatmap
+Heatmap(high_var_mat,
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "complete",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "complete",
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        name = "VST_Counts",
+        column_split = clusters,
+        top_annotation = column_annotation)
+```
+
+Creating corresponding PCA plot:
+
+```{r}
+#Creating a PCA dataframe PC scores of PC1 and PC2 for plotting
+pca_df <- data.frame(pca_res$x[, 1:2])
+
+# Adding cluster assignments to PCA dataframe
+pca_df$Cluster <- factor(clusters)
+
+# Creating a scatterplot of PC1 vs. PC2 where each point is colored by 'Cluster' 
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.5) +
+  scale_color_manual(values = hue_pal()(length(unique(clusters)))) +
+  theme_classic() +
+  labs(x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"), 
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"),
+       color = "Cluster")
+```
+
+# Differential Expression Analysis
+
+The core step of our workflow is Differential expression (DE) analysis which helps us move beyond just visualizing variation (like with PCA or clustering) and actually quantify which genes are changing between groups.
+
+Before going ahead with final DE analysis using DESeq2, let's quickly explore clustering-based insights and find candidate genes.
+
+## log2FC method (using `vsd` )
+
+This method offers quick exploratory comparison of average expression between clusters.
+
+```{r}
+# Add cluster assignments as a new column in metadata
+ccle_meta_li$Cluster <- factor(clusters)
+
+
+# Subset expression matrix by sample cluster
+cluster_1_data <- assay(vsd)[, ccle_meta_li$Cluster == 1]
+cluster_2_data <- assay(vsd)[, ccle_meta_li$Cluster == 2]
+
+
+# Compute average expression per cluster (for each gene)
+mean_cluster_1 <- rowMeans(cluster_1_data)
+mean_cluster_2 <- rowMeans(cluster_2_data)
+
+
+# Calculate log2 fold change in expression between clusters for each gene
+log2FC <- log2((mean_cluster_2 + 1) / (mean_cluster_1 + 1))
+# Note: Adding +1 avoids division by zero and stabilizes low counts
+# +ve values: upregulated in Cluster 2
+# -ve values: upregulated in Cluster 1
+
+
+# Create histogram of log2FC values
+ggplot(data.frame(log2FC = log2FC), aes(x = log2FC)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+  theme_minimal() +
+  labs(x = "Log2FC", y = "Frequency", title = "Log2FC Distribution")
+
+
+# Create a DEG table with gene names, avg. expression across both clusters, and log2 fold change
+degs_df <- data.frame(
+  gene = rownames(assay(vsd)),
+  mean_expression = (mean_cluster_1 + mean_cluster_2) / 2,
+  log2FC = log2FC
+)
+
+# Rank genes by absolute log2 FC
+degs_ranking <- order(abs(degs_df$log2FC), decreasing = TRUE)
+
+# Get 20 most differentially expressed genes between the two clusters
+top_degs <- degs_df[degs_ranking, ][1:20, ]
+print(top_degs)
+```
+
+[Interpretation]{.underline}: This histogram peaks at 0, indicating that most genes are not strongly differentially expressed between the two clusters. And positive log2FC for all these indicate that all are upregulated in cluster 2 (right side of PCA plot). It also aligns with more red in cluster 2 from our hierarchical clustering in the previous section. Also not, many of these explain variance along PC1 and PC2 as previously explored.
+
+Let's plot the expression of top 6 candidate DEGs we got from this method in PCA plots to see if they actually are differentially expressed.
+
+```{r}
+deg_genes <- c("LGALS4", "GPA33", "PHGR1", "CDX1", "PPP1R1B", "FABP1")
+
+expr_mat <- assay(vsd)[deg_genes, ] # rows = genes, columns = samples
+
+expr_df <- as.data.frame(t(expr_mat)) # rows = samples, columns = genes
+
+expr_df$Sample <- rownames(expr_df)
+
+pca_df$Sample <- rownames(pca_df)
+plot_df <- merge(pca_df, expr_df, by = "Sample")
+
+plot_long <- pivot_longer(
+  plot_df,
+  cols = all_of(deg_genes),
+  names_to = "Gene",
+  values_to = "Expression"
+)
+
+ggplot(plot_long, aes(x = PC1, y = PC2, color = Expression)) +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~ Gene, scales = "free", ncol = 3) +
+  scale_color_viridis_c() +
+  theme_classic() +
+  labs(title = "Expression of DEGs Overlaid on PCA",
+       x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"),
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"),
+       color = "Expression")
+```
+
+They indeed look upregulated in cluster 2.
+
+## DESeq2 method
+
+This method is designed for proper differential expression testing:
+
+-   **Statistical model:** It uses a negative binomial model for raw counts, estimating dispersion and library size.
+
+-   **Hypothesis testing:** Provides p-values and adjusted p-values (padj) controlling for multiple testing.
+
+-   **Handles replicates & covariates:** Can include batch effects or other variables in the design formula.
+
+-   **Variance shrinkage:** LFC shrinkage for more reliable effect size estimation (avoids inflated fold changes for low counts).
+
+This means **DESeq2 identifies genes whose differences are unlikely due to chance**, whereas our quick approach before just identifies genes with the largest fold changes (which could also be noise).
+
+```{r}
+# Construct a DESeqDataSet object using raw counts and metadata with cluster as design
+dds <- DESeqDataSetFromMatrix(countData = data.frame(ccle_counts_li),
+                              colData = ccle_meta_li,
+                              design = ~ Cluster)
+
+# Relevel the factor so that Cluster 2 becomes the reference level, i.e., log2FC = log2(cluster1/cluster2)
+dds$Cluster <- relevel(dds$Cluster, ref = "2")
+# +ve : upregulated in cluster 1
+# -ve : upregulated in cluster 2
+
+# Filter out genes with counts < 100
+dds <- dds[rowSums(counts(dds)) >= 100,]
+
+# Run DESeq2 for differential expression analysis
+dds <- DESeq(dds)
+```
+
+Now, let's extract the DE results table from our `dds` object that was created using the design formula `~ Cluster` . By default, it compares the non-reference level (1 in our case) of `Cluster` against the reference level we set (`Cluster 2`in our case).
+
+```{r}
+res <- results(dds)
+print(res)
+```
+
+Summary of DE analysis:
+
+```{r}
+summary(res)
+```
+
+[Interpretation]{.underline}: Out of 16,342 expressed genes, **6,703 (41%) are significantly differentially expressed** at FDR \< 0.1, with **\~27% up in Cluster 1** and **\~14% up in Cluster 2**, and no genes filtered out as low count or outliers.
+
+We will now filter these results to get most striking DEGs.
+
+```{r}
+# Step 1: Filter for padj < 0.001
+res_sig <- res[which(res$padj < 0.001), ]
+
+# Step 2: Reorder by absolute log2FoldChange (largest to smallest)
+res_reordered <- res_sig[order(abs(res_sig$log2FoldChange), decreasing = TRUE), ]
+res_reordered <- as.data.frame(res_reordered)
+
+# Step 3: Print the top genes
+print(head(res_reordered))
+```
+
+Identifying top 3 DEGs in both the clusters, respectively:
+
+```{r}
+# Top 3 upregulated in Cluster 1
+top3_cluster1 <- rownames(res_reordered[res_reordered$log2FoldChange > 0, ])[1:3]
+print(top3_cluster1)
+
+# Top 3 upregulated in Cluster 2
+top3_cluster2 <- rownames(res_reordered[res_reordered$log2FoldChange < 0, ])[1:3]
+print(top3_cluster2)
+```
+
+PCA visualization of these:
+
+```{r}
+top6_genes <- c(top3_cluster1, top3_cluster2)
+
+expr_mat <- assay(vsd)[top6_genes, ]
+expr_df <- as.data.frame(t(expr_mat))
+expr_df$Sample <- rownames(expr_df)
+
+# Merge with PCA info
+pca_df$Sample <- rownames(pca_df)
+plot_df <- merge(pca_df, expr_df, by = "Sample")
+
+# Reshape
+plot_long <- pivot_longer(plot_df, cols = all_of(top6_genes), names_to = "Gene", values_to = "Expression")
+
+# Plot
+ggplot(plot_long, aes(x = PC1, y = PC2, color = Expression)) +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~ Gene, scales = "free", ncol = 3) +
+  scale_color_viridis_c() +
+  theme_classic() +
+  labs(title = "Expression of Top DEGs on PCA",
+       x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"),
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"),
+       color = "Expression")
+```
+
+Based on this plot, there is some differential expression pattern in different clusters for each of these genes, so I am convinced these genes are DEGs.
+
+-   **SGIP1, PDPN, COL3A1 appear upregulated in cluster 1** (yellow-green spots on left)
+
+-   **SLC26A3, OLFM4, GPA33 appear upregulated in cluster 2** (yellow-green spots on right)
+
+But DEGs in cluster 1 could have fallen in clusters 3/4 if we defined 4 clusters.
+
+**GPA33** is most strikingly differentially expressed and was also found during previous data explorations.
+
+## Volcano Plot
+
+A volcano plot is a very common next step after DESeq2 results because it quickly visualizes which genes have the largest and most statistically significant differences between groups, combining both magnitude and significance of change in a single intuitive figure.
+
+```{r}
+EnhancedVolcano(
+  res_reordered,                  #Input dataframe of DE results
+  x = "log2FoldChange",           #Set the x-axis to use the log2FoldChange
+  y = "padj",                     #Set the y-axis to use the adjusted p-value (padj)
+  lab = rownames(res_reordered),  #Label each point (gene) using the row names of res_reordered
+  pCutoff = 0.00001,              #Set a stringent significance threshold for adjusted p-value (padj)
+  FCcutoff = 2,                   #Set the threshold for log2 fold change magnitude, >2 will be considered biologically significant.
+  labSize = 3,                    #Set the font size for the gene labels
+  title = "Cluster 1 vs Cluster 2 DEGs",
+  subtitle = "",
+  caption = ""
+) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+For a more readable volcano plot, let's focus on top 10 DEGs on each side.
+
+```{r}
+# Step 1: Identify top 10 DEGs on each side
+top_up <- res_reordered[res_reordered$log2FoldChange > 0, ]
+top_up <- head(top_up[order(-top_up$log2FoldChange), ], 10)
+
+top_down <- res_reordered[res_reordered$log2FoldChange < 0, ]
+top_down <- head(top_down[order(top_down$log2FoldChange), ], 10)
+
+top_genes <- c(rownames(top_up), rownames(top_down))
+print(top_genes)
+
+# Step 2: Volcano plot with smaller, more transparent points and selective labeling
+EnhancedVolcano(
+  res_reordered,
+  x = "log2FoldChange",
+  y = "padj",
+  lab = rownames(res_reordered),
+  selectLab = top_genes,
+  pCutoff = 0.00001,
+  FCcutoff = 2,
+  pointSize = 1.5,        # smaller dots
+  labSize = 3,
+  colAlpha = 0.6,         # more transparent dots
+  title = "Cluster 1 vs Cluster 2 DEGs",
+  subtitle = "",
+  caption = "",
+  drawConnectors = TRUE,
+  widthConnectors = 0.5,
+  max.overlaps = Inf 
+) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+[Interpretation]{.underline}: The genes on right (+ve log2FC values) are upregulated in cluster 1 and vice versa. Also, Y-axis (−log10 p-value) represents the significance of differential expression with higher values = more significant so as seen before, **GPA33** has strikingly differential expression and is also very significant.
+
+# Interpretation
+
+Overall, we defined **two groups** of large intestine cancer cell lines. The metadata couldn't help with defining variance sources so we looked at top DEGs in each cluster and based on that, following is the interpretation of biology of each group.
+
+## Normal Biological Functions of top 10 DEGs in each cluster:
+
+### Top 10 DEGs in Cluster 1 (High in Cluster 1):
+
+**SGIP1**: Endocytic protein involved in membrane trafficking and receptor internalization\
+**PDPN**: Podoplanin - lymphatic vessel marker and stromal cell surface glycoprotein\
+**COL3A1**: Type III collagen - extracellular matrix protein providing structural integrity\
+**PTN**: Pleiotrophin - growth factor involved in cell migration and angiogenesis\
+**ANGPTL2**: Angiopoietin-like protein 2 - regulates angiogenesis and stem cell maintenance\
+**GDF6**: Growth differentiation factor 6 - TGF-β family member for bone/joint formation\
+**KRTAP1-5**: Keratin-associated protein - structural protein in hair/epithelial cells\
+**PODN**: Podocan - extracellular matrix proteoglycan\
+**GNAT3**: G-protein alpha subunit - taste transduction signaling\
+**NTM**: Neurotrimin - cell adhesion molecule in neural development
+
+### Top 10 DEGs in Cluster 2 (High in Cluster 2):
+
+**SLC26A3**: Chloride/bicarbonate exchanger - essential for intestinal ion transport\
+**OLFM4**: Olfactomedin 4 - intestinal stem cell marker and antimicrobial protein\
+**GPA33**: Glycoprotein A33 - intestinal epithelial cell surface antigen (we discussed earlier)\
+**FABP1**: Fatty acid binding protein 1 - lipid metabolism in liver and intestine\
+**TINAG**: Tubulointerstitial nephritis antigen - extracellular matrix protein\
+**UGT1A10**: UDP-glucuronosyltransferase - drug/xenobiotic detoxification enzyme\
+**SPINK4**: Serine protease inhibitor - antimicrobial defense in intestine\
+**MUC17**: Mucin 17 - membrane-bound mucin protecting intestinal epithelial barrier\
+**PIGR**: Polymeric immunoglobulin receptor - transports antibodies across epithelium\
+**MOGAT2**: Monoacylglycerol acyltransferase 2 - lipid metabolism enzyme
+
+## Role in Large Intestine Cancer:
+
+### Cluster 1 (Stromal/Mesenchymal-like):
+
+-   **PDPN**: Cancer-associated fibroblast marker; promotes invasion and metastasis
+
+-   **COL3A1**: Overexpressed in CRC epithelium; promotes proliferation via PI3K/AKT signaling
+
+-   **PTN, ANGPTL2, GDF6**: Growth factors supporting angiogenesis and tumor progression
+
+-   **Overall phenotype**: Enhanced stromal activation, EMT, invasion, and poor prognosis
+
+### Cluster 2 (Epithelial/Differentiated-like):
+
+-   **SLC26A3, UGT1A10, PIGR**: Maintain differentiated intestinal epithelial functions (like transportation)
+
+-   **OLFM4**: Intestinal stem cell marker; indicates preserved stem cell hierarchy
+
+-   **MUC17**: Protective mucin barrier function
+
+-   **MOGAT2**: Tumor suppressor in CRC; loss promotes tumor progression
+
+-   **Overall phenotype**: Preserved intestinal epithelial identity and metabolic functions
+
+## Biological Difference Between Clusters:
+
+**Cluster 1** likely represents **"Stromal-Activated/Mesenchymal-like Cancer"**:
+
+-   High stromal gene expression (PDPN, COL3A1, growth factors)
+
+-   Enhanced cancer-associated fibroblast activity
+
+-   Increased EMT, invasion, and metastatic potential
+
+-   Corresponds to **CMS4-like** aggressive, stromal-infiltrated tumors
+
+**Cluster 2** likely represents **"Epithelial-Differentiated Cancer"**:
+
+-   Preserved intestinal epithelial gene expression (transporters, mucins, metabolic enzymes)
+
+-   Maintained differentiated cellular functions
+
+-   Better preservation of normal intestinal architecture
+
+-   Corresponds to **CMS2-like** canonical, differentiated tumors
+
+**Summary**: The clusters likely distinguish between **"Stromal-Driven Aggressive"** vs **"Epithelial-Differentiated"** colorectal cancer phenotypes, representing fundamentally different mechanisms of tumorigenesis and clinical behavior. This difference in biology of clusters 1 & 2 was also somewhat captured in PCA in previous sections. Finally, we should define more clusters in the future to obtain finer details of biological differences between large intestine cancer cell lines in this CCLE dataset.
