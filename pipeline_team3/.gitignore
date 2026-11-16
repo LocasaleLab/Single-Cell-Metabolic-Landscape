@@ -1,0 +1,12 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+*_cache/
+*_files/
+.quarto/
+_freeze/
+outs/
+data/raw/
+data/
